@@ -1,0 +1,421 @@
+import sys
+import time
+import random
+import sqlite3
+from datetime import datetime
+from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
+                            QHBoxLayout, QLabel, QPushButton, QLineEdit, 
+                            QTableWidget, QTableWidgetItem, QHeaderView,
+                            QMessageBox, QComboBox)
+from PyQt5.QtCore import QTimer, Qt, pyqtSlot
+from PyQt5.QtGui import QFont, QColor
+import paho.mqtt.client as mqtt
+import requests
+
+
+class SimulatedTempHumiditySensor:
+    def __init__(self, base_temp=22.0, base_humidity=50.0, variance=2.0):
+        self.base_temp = base_temp
+        self.base_humidity = base_humidity
+        self.variance = variance
+    
+    def read(self):
+       
+        temp = self.base_temp + (random.random() * 2 - 1) * self.variance
+        humidity = self.base_humidity + (random.random() * 2 - 1) * self.variance
+        return temp, humidity
+
+class DatabaseManager:
+    def __init__(self, db_path="smart_home.db"):
+        self.conn = sqlite3.connect(db_path)
+        self.cursor = self.conn.cursor()
+        self.create_tables()
+    
+    def create_tables(self):
+     
+        self.cursor.execute('''
+        CREATE TABLE IF NOT EXISTS sensor_readings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            sensor_id TEXT,
+            temperature REAL,
+            humidity REAL,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+        ''')
+        
+
+        self.cursor.execute('''
+        CREATE TABLE IF NOT EXISTS alerts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            sensor_id TEXT,
+            alert_type TEXT,
+            value REAL,
+            threshold REAL,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+        ''')
+        
+
+        self.cursor.execute('''
+        CREATE TABLE IF NOT EXISTS settings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            setting_name TEXT UNIQUE,
+            setting_value TEXT
+        )
+        ''')
+        
+
+        self.cursor.execute("INSERT OR IGNORE INTO settings (setting_name, setting_value) VALUES (?, ?)", 
+                           ("temp_threshold", "28.0"))
+        self.cursor.execute("INSERT OR IGNORE INTO settings (setting_name, setting_value) VALUES (?, ?)", 
+                           ("humidity_threshold", "70.0"))
+        self.cursor.execute("INSERT OR IGNORE INTO settings (setting_name, setting_value) VALUES (?, ?)", 
+                           ("notification_phone", "+1234567890"))
+        
+        self.conn.commit()
+    
+    def save_reading(self, sensor_id, temperature, humidity):
+        self.cursor.execute(
+            "INSERT INTO sensor_readings (sensor_id, temperature, humidity) VALUES (?, ?, ?)",
+            (sensor_id, temperature, humidity)
+        )
+        self.conn.commit()
+    
+    def save_alert(self, sensor_id, alert_type, value, threshold):
+        self.cursor.execute(
+            "INSERT INTO alerts (sensor_id, alert_type, value, threshold) VALUES (?, ?, ?, ?)",
+            (sensor_id, alert_type, value, threshold)
+        )
+        self.conn.commit()
+    
+    def get_recent_readings(self, limit=10):
+        self.cursor.execute(
+            "SELECT sensor_id, temperature, humidity, timestamp FROM sensor_readings ORDER BY timestamp DESC LIMIT ?",
+            (limit,)
+        )
+        return self.cursor.fetchall()
+    
+    def get_recent_alerts(self, limit=10):
+        self.cursor.execute(
+            "SELECT sensor_id, alert_type, value, threshold, timestamp FROM alerts ORDER BY timestamp DESC LIMIT ?",
+            (limit,)
+        )
+        return self.cursor.fetchall()
+    
+    def get_setting(self, setting_name):
+        self.cursor.execute("SELECT setting_value FROM settings WHERE setting_name = ?", (setting_name,))
+        result = self.cursor.fetchone()
+        return result[0] if result else None
+    
+    def update_setting(self, setting_name, setting_value):
+        self.cursor.execute(
+            "UPDATE settings SET setting_value = ? WHERE setting_name = ?",
+            (setting_value, setting_name)
+        )
+        self.conn.commit()
+    
+    def close(self):
+        self.conn.close()
+
+class NotificationService:
+    def __init__(self, db_manager):
+        self.db_manager = db_manager
+
+        self.mqtt_client = mqtt.Client()
+        self.mqtt_connected = False
+        self.mqtt_broker = "localhost"
+        self.mqtt_port = 1883
+    
+    def connect_mqtt(self, broker="localhost", port=1883):
+        try:
+            self.mqtt_broker = broker
+            self.mqtt_port = port
+            self.mqtt_client.connect(broker, port, 60)
+            self.mqtt_client.loop_start()
+            self.mqtt_connected = True
+            return True
+        except Exception as e:
+            print(f"MQTT Connection failed: {e}")
+            self.mqtt_connected = False
+            return False
+    
+    def disconnect_mqtt(self):
+        if self.mqtt_connected:
+            self.mqtt_client.loop_stop()
+            self.mqtt_client.disconnect()
+            self.mqtt_connected = False
+    
+    def send_mqtt_alert(self, topic, message):
+        if self.mqtt_connected:
+            self.mqtt_client.publish(topic, message)
+            return True
+        return False
+    
+    def send_sms_alert(self, message):
+        phone_number = self.db_manager.get_setting("notification_phone")
+        
+        print(f"SMS ALERT to {phone_number}: {message}")
+        return True
+
+class SmartHomeMonitor(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Smart Home Temperature Monitor")
+        self.setGeometry(100, 100, 800, 600)
+    
+        self.db_manager = DatabaseManager()
+        self.sensor = SimulatedTempHumiditySensor()
+        self.notification_service = NotificationService(self.db_manager)
+        
+        self.temp_threshold = float(self.db_manager.get_setting("temp_threshold"))
+        self.humidity_threshold = float(self.db_manager.get_setting("humidity_threshold"))
+        
+        self.central_widget = QWidget()
+        self.setCentralWidget(self.central_widget)
+        self.main_layout = QVBoxLayout(self.central_widget)
+        
+        self.create_current_readings_widget()
+        
+        self.create_threshold_settings_widget()
+        
+        self.create_connection_settings_widget()
+        
+        self.create_history_tables()
+        
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.update_sensor_reading)
+        self.timer.start(5000) 
+        
+        self.update_sensor_reading()
+    
+    def create_current_readings_widget(self):
+        readings_widget = QWidget()
+        readings_layout = QHBoxLayout(readings_widget)
+
+        temp_widget = QWidget()
+        temp_layout = QVBoxLayout(temp_widget)
+        temp_title = QLabel("Temperature")
+        temp_title.setAlignment(Qt.AlignCenter)
+        temp_title.setFont(QFont("Arial", 14, QFont.Bold))
+        self.temp_value = QLabel("--°C")
+        self.temp_value.setAlignment(Qt.AlignCenter)
+        self.temp_value.setFont(QFont("Arial", 24))
+        temp_layout.addWidget(temp_title)
+        temp_layout.addWidget(self.temp_value)
+
+        humidity_widget = QWidget()
+        humidity_layout = QVBoxLayout(humidity_widget)
+        humidity_title = QLabel("Humidity")
+        humidity_title.setAlignment(Qt.AlignCenter)
+        humidity_title.setFont(QFont("Arial", 14, QFont.Bold))
+        self.humidity_value = QLabel("--%")
+        self.humidity_value.setAlignment(Qt.AlignCenter)
+        self.humidity_value.setFont(QFont("Arial", 24))
+        humidity_layout.addWidget(humidity_title)
+        humidity_layout.addWidget(self.humidity_value)
+        
+        readings_layout.addWidget(temp_widget)
+        readings_layout.addWidget(humidity_widget)
+        
+        self.main_layout.addWidget(readings_widget)
+    
+    def create_threshold_settings_widget(self):
+        settings_widget = QWidget()
+        settings_layout = QHBoxLayout(settings_widget)
+        
+        temp_threshold_widget = QWidget()
+        temp_threshold_layout = QHBoxLayout(temp_threshold_widget)
+        temp_threshold_layout.addWidget(QLabel("Temperature Threshold (°C):"))
+        self.temp_threshold_input = QLineEdit(str(self.temp_threshold))
+        temp_threshold_layout.addWidget(self.temp_threshold_input)
+
+        humidity_threshold_widget = QWidget()
+        humidity_threshold_layout = QHBoxLayout(humidity_threshold_widget)
+        humidity_threshold_layout.addWidget(QLabel("Humidity Threshold (%):"))
+        self.humidity_threshold_input = QLineEdit(str(self.humidity_threshold))
+        humidity_threshold_layout.addWidget(self.humidity_threshold_input)
+
+        phone_widget = QWidget()
+        phone_layout = QHBoxLayout(phone_widget)
+        phone_layout.addWidget(QLabel("Notification Phone:"))
+        self.phone_input = QLineEdit(self.db_manager.get_setting("notification_phone"))
+        phone_layout.addWidget(self.phone_input)
+
+        save_button = QPushButton("Save Settings")
+        save_button.clicked.connect(self.save_settings)
+        
+        settings_layout.addWidget(temp_threshold_widget)
+        settings_layout.addWidget(humidity_threshold_widget)
+        settings_layout.addWidget(phone_widget)
+        settings_layout.addWidget(save_button)
+        
+        self.main_layout.addWidget(settings_widget)
+    
+    def create_connection_settings_widget(self):
+        connection_widget = QWidget()
+        connection_layout = QHBoxLayout(connection_widget)
+
+        connection_layout.addWidget(QLabel("MQTT Broker:"))
+        self.mqtt_broker_input = QLineEdit("localhost")
+        connection_layout.addWidget(self.mqtt_broker_input)
+        
+        connection_layout.addWidget(QLabel("Port:"))
+        self.mqtt_port_input = QLineEdit("1883")
+        self.mqtt_port_input.setMaximumWidth(80)
+        connection_layout.addWidget(self.mqtt_port_input)
+
+        self.connect_button = QPushButton("Connect MQTT")
+        self.connect_button.clicked.connect(self.toggle_mqtt_connection)
+        connection_layout.addWidget(self.connect_button)
+
+        simulate_button = QPushButton("Simulate Alert")
+        simulate_button.clicked.connect(self.simulate_alert)
+        connection_layout.addWidget(simulate_button)
+        
+        self.main_layout.addWidget(connection_widget)
+    
+    def create_history_tables(self):
+
+        history_widget = QWidget()
+        history_layout = QVBoxLayout(history_widget)
+        
+
+        readings_label = QLabel("Recent Sensor Readings")
+        readings_label.setFont(QFont("Arial", 12, QFont.Bold))
+        history_layout.addWidget(readings_label)
+        
+        self.readings_table = QTableWidget(0, 4)
+        self.readings_table.setHorizontalHeaderLabels(["Sensor ID", "Temperature", "Humidity", "Timestamp"])
+        self.readings_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        history_layout.addWidget(self.readings_table)
+        
+ 
+        alerts_label = QLabel("Recent Alerts")
+        alerts_label.setFont(QFont("Arial", 12, QFont.Bold))
+        history_layout.addWidget(alerts_label)
+        
+        self.alerts_table = QTableWidget(0, 5)
+        self.alerts_table.setHorizontalHeaderLabels(["Sensor ID", "Alert Type", "Value", "Threshold", "Timestamp"])
+        self.alerts_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        history_layout.addWidget(self.alerts_table)
+        
+        self.main_layout.addWidget(history_widget)
+
+        self.update_history_tables()
+    
+    def update_sensor_reading(self):
+
+        temperature, humidity = self.sensor.read()
+
+        self.temp_value.setText(f"{temperature:.1f}°C")
+        self.humidity_value.setText(f"{humidity:.1f}%")
+
+        if temperature > self.temp_threshold:
+            self.temp_value.setStyleSheet("color: red; font-weight: bold;")
+        else:
+            self.temp_value.setStyleSheet("")
+            
+        if humidity > self.humidity_threshold:
+            self.humidity_value.setStyleSheet("color: red; font-weight: bold;")
+        else:
+            self.humidity_value.setStyleSheet("")
+
+        sensor_id = "main_temp_sensor"
+        self.db_manager.save_reading(sensor_id, temperature, humidity)
+
+        if temperature > self.temp_threshold:
+            alert_message = f"ALERT: Temperature ({temperature:.1f}°C) exceeds threshold ({self.temp_threshold}°C)"
+            self.db_manager.save_alert(sensor_id, "temperature", temperature, self.temp_threshold)
+
+            if self.notification_service.mqtt_connected:
+                self.notification_service.send_mqtt_alert("smart_home/alerts/temperature", alert_message)
+
+            self.notification_service.send_sms_alert(alert_message)
+        
+        if humidity > self.humidity_threshold:
+            alert_message = f"ALERT: Humidity ({humidity:.1f}%) exceeds threshold ({self.humidity_threshold}%)"
+            self.db_manager.save_alert(sensor_id, "humidity", humidity, self.humidity_threshold)
+
+            if self.notification_service.mqtt_connected:
+                self.notification_service.send_mqtt_alert("smart_home/alerts/humidity", alert_message)
+
+            self.notification_service.send_sms_alert(alert_message)
+
+        self.update_history_tables()
+    
+    def update_history_tables(self):
+
+        readings = self.db_manager.get_recent_readings()
+        self.readings_table.setRowCount(len(readings))
+        
+        for i, (sensor_id, temp, humidity, timestamp) in enumerate(readings):
+            self.readings_table.setItem(i, 0, QTableWidgetItem(sensor_id))
+            self.readings_table.setItem(i, 1, QTableWidgetItem(f"{temp:.1f}°C"))
+            self.readings_table.setItem(i, 2, QTableWidgetItem(f"{humidity:.1f}%"))
+            self.readings_table.setItem(i, 3, QTableWidgetItem(timestamp))
+
+        alerts = self.db_manager.get_recent_alerts()
+        self.alerts_table.setRowCount(len(alerts))
+        
+        for i, (sensor_id, alert_type, value, threshold, timestamp) in enumerate(alerts):
+            self.alerts_table.setItem(i, 0, QTableWidgetItem(sensor_id))
+            self.alerts_table.setItem(i, 1, QTableWidgetItem(alert_type))
+            self.alerts_table.setItem(i, 2, QTableWidgetItem(f"{value:.1f}"))
+            self.alerts_table.setItem(i, 3, QTableWidgetItem(f"{threshold:.1f}"))
+            self.alerts_table.setItem(i, 4, QTableWidgetItem(timestamp))
+
+            for j in range(5):
+                item = self.alerts_table.item(i, j)
+                item.setBackground(QColor(255, 200, 200))
+    
+    def save_settings(self):
+        try:
+
+            self.temp_threshold = float(self.temp_threshold_input.text())
+            self.humidity_threshold = float(self.humidity_threshold_input.text())
+
+            self.db_manager.update_setting("temp_threshold", str(self.temp_threshold))
+            self.db_manager.update_setting("humidity_threshold", str(self.humidity_threshold))
+            self.db_manager.update_setting("notification_phone", self.phone_input.text())
+            
+            QMessageBox.information(self, "Settings Saved", "Your threshold settings have been updated.")
+        except ValueError:
+            QMessageBox.warning(self, "Invalid Input", "Please enter valid numeric values for thresholds.")
+    
+    def toggle_mqtt_connection(self):
+        if not self.notification_service.mqtt_connected:
+            broker = self.mqtt_broker_input.text()
+            try:
+                port = int(self.mqtt_port_input.text())
+            except ValueError:
+                QMessageBox.warning(self, "Invalid Port", "Please enter a valid port number.")
+                return
+                
+            if self.notification_service.connect_mqtt(broker, port):
+                self.connect_button.setText("Disconnect MQTT")
+                QMessageBox.information(self, "Connection Success", f"Connected to MQTT broker at {broker}:{port}")
+            else:
+                QMessageBox.warning(self, "Connection Failed", f"Failed to connect to MQTT broker at {broker}:{port}")
+        else:
+            self.notification_service.disconnect_mqtt()
+            self.connect_button.setText("Connect MQTT")
+            QMessageBox.information(self, "Disconnected", "Disconnected from MQTT broker")
+    
+    def simulate_alert(self):
+
+        original_base_temp = self.sensor.base_temp
+        self.sensor.base_temp = self.temp_threshold + 5
+        self.update_sensor_reading()
+        self.sensor.base_temp = original_base_temp
+
+    def closeEvent(self, event):
+        self.timer.stop()
+        self.notification_service.disconnect_mqtt()
+        self.db_manager.close()
+        event.accept()
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    window = SmartHomeMonitor()
+    window.show()
+    sys.exit(app.exec_())
